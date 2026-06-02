@@ -1,13 +1,21 @@
 """
 NDRIMS 카카오 챗봇 스킬 서버
-- 메뉴구조.xlsx 를 읽어 카카오 버튼 메뉴 자동 생성
+- menu.xlsx 를 읽어 카카오 버튼 메뉴 자동 생성
 - 버튼 클릭 → NDRIMS API 호출 → 텍스트/카드 응답
 - 카톡에서 쿠키값 직접 갱신 가능
 """
 
-import json, os, threading, urllib.request, re
+import json, os, threading, urllib.request, re, sqlite3
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from datetime import datetime, timezone, timedelta
+from text_responses import (
+    TEXT_RESPONSES,
+    ERR_NO_REQUESTS, ERR_NO_COOKIE, ERR_NDRIMS_CONN,
+    ERR_MENU_NOT_FOUND, ERR_UNKNOWN_ATYPE, ERR_UNKNOWN_DATA,
+    MSG_COOKIE_START, MSG_NO_ADMIN_PW, MSG_PASSWORD_OK,
+    MSG_WRONG_PASSWORD, MSG_WRONG_FORMAT,
+)
 
 # openpyxl 은 pip install openpyxl 로 설치
 try:
@@ -18,6 +26,13 @@ except ImportError:
     print("[경고] openpyxl 없음 — pip install openpyxl")
 
 try:
+    from dotenv import load_dotenv
+    DOTENV_OK = True
+except ImportError:
+    DOTENV_OK = False
+    print("[경고] python-dotenv 없음 — pip install python-dotenv")
+
+try:
     import requests as req_lib
     REQUESTS_OK = True
 except ImportError:
@@ -26,61 +41,74 @@ except ImportError:
 
 BASE_DIR = Path(__file__).parent
 
-# ── 쿠키 상태 (메모리 보관, 서버 재시작 시 초기화) ─────────────
-cookie_store = {
-    "WMONID":     os.environ.get("WMONID", ""),
-    "JSESSIONID": os.environ.get("JSESSIONID", ""),
-}
+if DOTENV_OK:
+    load_dotenv(BASE_DIR / ".env")
 
-# ── 규정 텍스트 (간단하게 딕셔너리로 관리) ─────────────────────
-TEXT_RESPONSES = {
-    "budget_rule": (
-        "💰 연구비 사용 한도\n\n"
-        "• 50만 원 이하 → 팀장 승인\n"
-        "• 50만 원 초과 → 소장 결재\n"
-        "• 100만 원 초과 → 사전 품의서 필수\n\n"
-        "📌 근거: 연구비관리규정 제7조"
-    ),
-    "travel_domestic": (
-        "🇰🇷 국내 출장 규정\n\n"
-        "• 일비: 연구원 2만 원 / 책임 3만 원\n"
-        "• 숙박: 실비 (상한 7만 원/박)\n"
-        "• 서울 출장: 당일 복귀 원칙\n"
-        "• 신청: 출발 3일 전까지\n\n"
-        "📌 근거: 출장여비규정 제3·5조"
-    ),
-    "travel_overseas": (
-        "✈️ 해외 출장 규정\n\n"
-        "• 신청: 출발 7일 전까지\n"
-        "• 항공: 이코노미 원칙\n"
-        "  (14시간 초과 시 비즈니스 허용)\n"
-        "• 일비: 국가별 기준표 적용\n\n"
-        "📌 근거: 출장여비규정 제8조"
-    ),
-    "equipment_rule": (
-        "🔧 공용 장비 예약\n\n"
-        "• 사용 2일 전까지 시스템 예약 필수\n"
-        "• 예약 없이 사용 불가\n"
-        "• 미사용 취소: 24시간 전까지\n"
-        "• 고장 발견 시 즉시 내선 234 신고\n\n"
-        "📌 근거: 장비관리규정 제4·10조"
-    ),
-    "help": (
-        "📖 사용법\n\n"
-        "1️⃣ 메인 메뉴 버튼을 눌러 탐색\n"
-        "2️⃣ 버튼이 없으면 자유롭게 질문\n\n"
-        "⚙️ 쿠키 갱신 방법\n"
-        "설정 → 쿠키 갱신 버튼 후\n"
-        "아래 형식으로 입력하세요:\n"
-        "WMONID=값 JSESSIONID=값"
-    ),
-    "update_cookie": "__COOKIE_INPUT__",  # 특수 처리
+ADMIN_PASSWORD = os.environ.get("DGUSSB_PASSWORD", "")
+
+# ── Utils ────────────────────────────────────────────
+def get_kst() -> str:
+    kst = datetime.now(timezone(timedelta(hours=9)))
+    return kst.strftime("%Y-%m-%d %H:%M:%S")
+
+# ── SQLite 캐시 ──────────────────────────────────────
+DB_PATH = BASE_DIR / "cache.db"
+
+def init_db():
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS cache (
+                action TEXT PRIMARY KEY,
+                text   TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS cookies (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+        """)
+
+def cache_save(action: str, text: str):
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO cache (action, text, updated_at) VALUES (?, ?, ?)",
+            (action, text, get_kst())
+        )
+
+def cache_load(action: str) -> tuple[str | None, str | None]:
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT text, updated_at FROM cache WHERE action = ?", (action,)
+        ).fetchone()
+    return (row[0], row[1]) if row else (None, None)
+
+def save_cookies():
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("INSERT OR REPLACE INTO cookies VALUES ('WMONID', ?)",     (cookie_store["WMONID"],))
+        conn.execute("INSERT OR REPLACE INTO cookies VALUES ('JSESSIONID', ?)", (cookie_store["JSESSIONID"],))
+
+def load_cookies():
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            rows = conn.execute("SELECT key, value FROM cookies").fetchall()
+            return {k: v for k, v in rows}
+    except Exception:
+        return {}
+
+init_db()
+_saved = load_cookies()
+# ── 쿠키 상태 (DB → 환경변수 순으로 로드) ────────────────────
+cookie_store = {
+    "WMONID":     _saved.get("WMONID")     or os.environ.get("WMONID", ""),
+    "JSESSIONID": _saved.get("JSESSIONID") or os.environ.get("JSESSIONID", ""),
 }
 
 # ── 엑셀 메뉴 로드 ────────────────────────────────────────────
 def load_menu() -> dict:
     """
-    메뉴구조.xlsx 를 읽어 트리 구조로 변환.
+    menu.xlsx 를 읽어 트리 구조로 변환.
     반환 형태:
     {
       "A": {
@@ -95,13 +123,13 @@ def load_menu() -> dict:
       }, ...
     }
     """
-    path = BASE_DIR / "메뉴구조.xlsx"
+    path = BASE_DIR / "menu.xlsx"
     if not EXCEL_OK or not path.exists():
-        print("[경고] 메뉴구조.xlsx 없음 — 기본 메뉴 사용")
+        print("[경고] menu.xlsx 없음 — 기본 메뉴 사용")
         return {}
 
     wb = openpyxl.load_workbook(path)
-    ws = wb["메뉴구조"]
+    ws = wb["menu"]
 
     tree = {}
     for row in ws.iter_rows(min_row=2, values_only=True):
@@ -143,7 +171,26 @@ def load_menu() -> dict:
 
 MENU = load_menu()
 
-# ── NDRIMS API 호출 ──────────────────────────────────────────
+
+def build_menu_label_index(tree: dict) -> dict[str, str]:
+    index: dict[str, str] = {}
+
+    def walk(nodes: dict):
+        for menu_id, node in nodes.items():
+            label = (node.get("label") or "").strip()
+            if label and label not in index:
+                index[label] = menu_id
+            children = node.get("children", {})
+            if children:
+                walk(children)
+
+    walk(tree)
+    return index
+
+
+MENU_LABEL_INDEX = build_menu_label_index(MENU)
+
+# ── nDRIMS API 호출 ──────────────────────────────────────────
 def make_ndrims_session():
     if not REQUESTS_OK:
         return None
@@ -176,128 +223,379 @@ def get_running_values(session) -> dict:
     )
     data2 = res2.json()
     user_info = data2["dmUserInfo"]
-    return {
-        "_runningNana": nana,
-        "_runningLoginIdenNo": user_info["LOGIN_IDEN_NO"],
-        "_runningMainOpenKey": user_info["MAIN_OPEN_KEY"],
-    }
+    return nana, user_info["LOGIN_IDEN_NO"], user_info["MAIN_OPEN_KEY"]
 
 
 def call_ndrims(action: str) -> str:
     """액션값에 따라 NDRIMS API 호출 → 텍스트 결과 반환."""
     if not REQUESTS_OK:
-        return "⚠️ requests 라이브러리가 없어요.\npip install requests 후 재시작하세요."
+        text, _ = cache_load(action)
+        if text:
+            return text
+        return ERR_NO_REQUESTS
     if not cookie_store["JSESSIONID"]:
-        return "⚠️ 쿠키가 설정되지 않았어요.\n설정 → 쿠키 갱신에서 먼저 쿠키를 입력해 주세요."
+        text, _ = cache_load(action)
+        if text:
+            return text
+        return ERR_NO_COOKIE
 
     try:
         session = make_ndrims_session()
-        rv = get_running_values(session)
+        print(f"[NDRIMS] 세션 생성 완료")
+
+        try:
+            rv = get_running_values(session)
+            menu_payload = {
+                "_runningNana": rv[0],
+                "_runningLoginIdenNo": rv[1],
+                "_runningMainOpenKey": rv[2],
+                "@d1#MENU_NO": "10497",
+                "@d1#MOBILE_YN": "N",
+                "@d#": "@d1#",
+                "@d1#": "dmSearch",
+                "@d1#tp": "dm",
+            }
+            
+            menu_res = session.post(
+                "https://ndrims.dongguk.edu/unis/main/view/menu/doListUserMenuListLeft.do",
+                data=menu_payload, timeout=10
+            )
+            menu_data = menu_res.json()
+            print(f"[NDRIMS] doListUserMenuListLeft 호출 성공")
+            # dsUserMenuListLeft에서 PGM_URL이 app/rs/rsb/prjfi/RsbPrjfi100인 항목 찾기
+            menu_items = menu_data.get("dsUserMenuListLeft", [])
+            for item in menu_items:
+                pgm_url = item.get("PGM_URL") or ""
+                if "app/rs/rsb/prjfi/RsbPrjfi100" in pgm_url:
+                    RsbPrjfi100_nana = item.get("NANA")
+                    print(f"[NDRIMS] RsbPrjfi100_nana 추출: {RsbPrjfi100_nana[:8] if RsbPrjfi100_nana else 'EMPTY'}...")
+                    break
+        except Exception as e:
+            print(f"[NDRIMS] ⚠️ 에러: {e}")
+            text, _ = cache_load(action)
+            if text:
+                return text
+            return ERR_NDRIMS_CONN
+
+        print(f"[NDRIMS] 요청 액션: {action}")
 
         # ── 과제 목록 ─────────────────────────────────────
         if action == "project_list":
+            # build payload as requested
             payload = {
-                **rv,
-                "@d1#PROJ_NO": "",
-                "@d1#USE_YY_MM": "",
-                "@d1#APRV_INCLD_YN": "Y",
-                "@d#": "@d1#", "@d1#": "dmSearchDscMain", "@d1#tp": "dm",
+                "_runningNana": RsbPrjfi100_nana,
+                "_runningLoginIdenNo": rv[1],
+                "_runningMainOpenKey": rv[2],
+                "@d1#CHIFR_MEMB_NO": "SE260018",
+                "@d1#CHIFR_MEMB_NM": "박현준",
+                "@d1#INCLD_YN": "N",
+                "@d#": "@d1#",
+                "@d1#": "dmSearch",
+                "@d1#tp": "dm",
             }
+
+            # call the list endpoint (same endpoint as before)
             res = session.post(
-                "https://ndrims.dongguk.edu/rs/rsb/prjfi/RsbPrjfi100/doListDscMain.do",
-                data=payload, timeout=10
+                "https://ndrims.dongguk.edu/rs/rsb/prjfi/RsbPrjfi100/doList.do",
+                data=payload, timeout=15
             )
             data = res.json()
-            items = data.get("dsSearchDscMain", {}).get("dsSearchDscMain", [])
+            print(f"[NDRIMS] 응답 상태: {res.status_code}")
+            
+            # response structure: dsMain is directly a list
+            items = []
+            if isinstance(data.get("dsMain"), list):
+                items = data.get("dsMain", [])
+                print(f"[NDRIMS] dsMain 리스트에서 {len(items)}개 항목 발견")
+            elif isinstance(data.get("dsMain"), dict):
+                # fallback: dsMain.dsMain 형태
+                items = data.get("dsMain", {}).get("dsMain", []) or []
+                print(f"[NDRIMS] dsMain.dsMain에서 {len(items)}개 항목 발견")
+            
             if not items:
-                return "조회된 과제가 없어요."
-            lines = ["📂 진행 중인 과제 목록\n"]
-            for it in items[:10]:
-                lines.append(f"• [{it.get('PROJ_NO','')}] {it.get('PROJ_NM','')}")
-            return "\n".join(lines)
+                # try dsSearchDscMain as last resort
+                items = data.get("dsSearchDscMain", {}).get("dsSearchDscMain", []) or []
+                if items:
+                    print(f"[NDRIMS] dsSearchDscMain에서 {len(items)}개 항목 발견 (fallback)")
 
-        # ── 과제별 지출 현황 ──────────────────────────────
-        elif action in ("expense_by_project", "expense_by_item", "budget_remain"):
-            payload = {
-                **rv,
-                "@d1#PROJ_NO": "",
-                "@d1#USE_YY_MM": "",
-                "@d1#APRV_INCLD_YN": "Y",
-                "@d#": "@d1#", "@d1#": "dmSearchDscMain", "@d1#tp": "dm",
-            }
-            res = session.post(
-                "https://ndrims.dongguk.edu/rs/rsb/prjfi/RsbPrjfi100/doListDscMain.do",
-                data=payload, timeout=10
-            )
-            data = res.json()
-            items = data.get("dsSearchDscMain", {}).get("dsSearchDscMain", [])
             if not items:
-                return "조회된 데이터가 없어요."
+                print(f"[NDRIMS] ⚠️ 데이터 없음 - 응답 키: {list(data.keys())}")
+                return ERR_UNKNOWN_DATA
 
-            if action == "expense_by_project":
-                lines = ["📊 과제별 지출 현황\n"]
-                for it in items[:8]:
-                    used  = int(it.get("USE_AMT", 0) or 0)
-                    total = int(it.get("TOT_AMT", 0) or 0)
-                    pct   = f"{used/total*100:.1f}%" if total else "—"
-                    lines.append(
-                        f"• {it.get('PROJ_NM','')}\n"
-                        f"  지출 {used:,}원 / 예산 {total:,}원 ({pct})"
-                    )
+            lines = ["📂 확인 가능한 과제 목록\n(" + get_kst() + " 기준)\n"]
+            for it in items:
+                proj_no = it.get("PROJ_NO", "")
+                proj_nm = it.get("PROJ_NM", "")
+                # 총연구기간: MYY_STR_DT ~ MYY_END_DT
+                myy_str = it.get("MYY_STR_DT", "")
+                myy_end = it.get("MYY_END_DT", "")
+                total_period = f"{myy_str[:4]}-{myy_str[4:6]}-{myy_str[6:]}" if myy_str else ""
+                total_period += f" ~ {myy_end[:4]}-{myy_end[4:6]}-{myy_end[6:]}" if myy_end else ""
+                total_period = total_period.strip()
+                
+                # 당해과제기간: STR_DT ~ END_DT
+                str_dt = it.get("STR_DT", "")
+                stt_close = it.get("END_DT", "")
+                this_period = f"{str_dt[:4]}-{str_dt[4:6]}-{str_dt[6:]}" if str_dt else ""
+                this_period += f" ~ {stt_close[:4]}-{stt_close[4:6]}-{stt_close[6:]}" if stt_close else ""
+                this_period = this_period.strip()
+                
+                chief = it.get("MAIN_OFFI_MEMB_NM", "")
+                this_amount = it.get("ALL_RES_AMT", "")
+                # 금액 포맷
+                if this_amount:
+                    this_amount = f"{int(this_amount):,}원"
+
+                lines.append(f"• 과제번호: {proj_no}")
+                lines.append(f"  과제명: {proj_nm}")
+                lines.append(f"  총연구기간: {total_period}")
+                lines.append(f"  당해과제기간: {this_period}")
+                lines.append(f"  과제담당자: {chief}")
+                lines.append(f"  당해연구비: {this_amount}")
+                lines.append("")
+
+            result = "\n".join(lines)
+            cache_save(action, result)
+            return result
+
+        # ── 과제 상세 정보 ──────────────────────────────
+        elif action in ("unsettled_details", "budget_balance", "research_details"):
+            if action == "unsettled_details":
+                payload = {
+                "_runningNana": RsbPrjfi100_nana,
+                "_runningLoginIdenNo": rv[1],
+                "_runningMainOpenKey": rv[2],
+                "@d1#PROJ_NO": "S2026A043400091", # [국고] [2단계] 지속가능한 학교안전 생태계 조성을 위한 연구[1/4]
+                "@d1#CARD_DIV_CD": "RE488.10",
+                "@d1#SELF_PROC_YN": "N",
+                "@d#": "@d1#", "@d1#": "dmSearchCardMain", "@d1#tp": "dm",
+                }
+                res = session.post(
+                    "https://ndrims.dongguk.edu/rs/rsb/prjfi/RsbPrjfi100/doListCardMain.do",
+                    data=payload, timeout=10
+                )
+                data = res.json()
+                if isinstance(data.get("dsProjCardMain"), list):
+                    items = data.get("dsProjCardMain", [])
+                    print(f"[NDRIMS] dsProjCardMain 리스트에서 {len(items)}개 항목 발견")
+                elif isinstance(data.get("dsProjCardMain"), dict):
+                    # fallback: dsProjCardMain.dsProjCardMain 형태
+                    items = data.get("dsProjCardMain", {}).get("dsProjCardMain", []) or []
+                    print(f"[NDRIMS] dsProjCardMain.dsProjCardMain에서 {len(items)}개 항목 발견")
+                lines = ["📊 미정산 내역\n(" + get_kst() + " 기준)\n"]
+                lines.append("• 연구비카드\n")
+                for it in items:
+                    # 카드사용자명, 승인일시, 금액
+                    card_user_nm = it.get("CARD_USER_NM", "(소유자)")
+                    card_aprv_dttms = it.get("CARD_APRV_DTTMS", "(승인일시)")
+                    aprv_amt = it.get("APRV_AMT", "(승인금액)")
+                    lines.append(f"- {card_aprv_dttms}\n{card_user_nm} 카드로 {aprv_amt}원 사용")
+                
+                payload = {
+                "_runningNana": RsbPrjfi100_nana,
+                "_runningLoginIdenNo": rv[1],
+                "_runningMainOpenKey": rv[2],
+                "@d1#PROJ_NO": "S2026G999900003", # [대응] [2단계] 지속가능한 학교안전 생태계 조성을 위한 연구[1/4]
+                "@d1#CARD_DIV_CD": "RE488.20",
+                "@d1#STR_DT": "20260301",
+                "@d1#END_DT": "20270228",
+                "@d1#CAMPUS_CD": "CM030.10",
+                "@d1#SELF_PROC_YN": "N",
+                "@d#": "@d1#", "@d1#": "dmSearchCorpCardMain", "@d1#tp": "dm",
+                }
+                res = session.post(
+                    "https://ndrims.dongguk.edu/rs/rsb/prjfi/RsbPrjfi100/doListCorpCardMain.do",
+                    data=payload, timeout=10
+                )
+                data = res.json()
+                if isinstance(data.get("dsCorpCardMain"), list):
+                    items = data.get("dsCorpCardMain", [])
+                    print(f"[NDRIMS] dsCorpCardMain 리스트에서 {len(items)}개 항목 발견")
+                elif isinstance(data.get("dsCorpCardMain"), dict):
+                    # fallback: dsCorpCardMain.dsCorpCardMain 형태
+                    items = data.get("dsCorpCardMain", {}).get("dsCorpCardMain", []) or []
+                    print(f"[NDRIMS] dsCorpCardMain.dsCorpCardMain에서 {len(items)}개 항목 발견")
+                lines.append(f"\n• 법인카드\n")
+                for it in items:
+                    # 카드사용자명, 승인일시, 금액
+                    card_user_nm = it.get("CARD_USER_NM", "(소유자)")
+                    card_aprv_dttms = it.get("CARD_APRV_DTTMS", "(승인일시)")
+                    aprv_amt = it.get("APRV_AMT", "(승인금액)")
+                    lines.append(f"- {card_aprv_dttms}\n{card_user_nm} 카드로 {aprv_amt}원 사용")
+                result = "\n".join(lines)
+                cache_save(action, result)
+                return result
+
+            elif action == "budget_balance":
+                payload = {
+                    "_runningNana": RsbPrjfi100_nana,
+                    "_runningLoginIdenNo": rv[1],
+                    "_runningMainOpenKey": rv[2],
+                    "@d1#PROJ_NO": "S2026A043400091", # 국고
+                    "@d1#SEARCH_GB": "1",
+                    "@d1#GRD_GB": "2",
+                    "@d1#SUPP_DIV_CD": "SB115.120",
+                    "@d#": "@d1#", "@d1#": "dmSearchBdgt", "@d1#tp": "dm",
+                }
+                res = session.post(
+                    "https://ndrims.dongguk.edu/rs/rsb/prjfi/RsbPrjfi100/doListBdgt.do",
+                    data=payload, timeout=10
+                )
+                data = res.json()
+                if isinstance(data.get("dsBdgt"), list):
+                    items = data.get("dsBdgt", [])
+                elif isinstance(data.get("dsBdgt"), dict):
+                    items = data.get("dsBdgt", {}).get("dsBdgt", []) or []
+                else:
+                    items = []
+
+                lines = ["💰 실행예산잔액\n(" + get_kst() + " 기준)\n"]
+                totals = {k: 0 for k in ("CARY_AMT", "BDGT_AMT", "NOW_BDGT_AMT", "USE_AMT", "USE_BALC_AMT", "NOT_USE_AMT", "NOT_USE_BALC_AMT")}
+                lines.append("• 연구비카드\n")
+                for it in items:
+                    def a(key): return int(it.get(key, 0) or 0)
+                    lines.append(f"비목명: {it.get('PROJ_ITEM_NM', '')}")
+                    lines.append(f"이월액: {a('CARY_AMT'):,}원")
+                    lines.append(f"예산액: {a('BDGT_AMT'):,}원")
+                    lines.append(f"예산총액: {a('NOW_BDGT_AMT'):,}원")
+                    lines.append(f"집행액: {a('USE_AMT'):,}원")
+                    lines.append(f"잔액: {a('USE_BALC_AMT'):,}원")
+                    lines.append(f"진행중: {a('NOT_USE_AMT'):,}원")
+                    lines.append(f"진행포함잔액: {a('NOT_USE_BALC_AMT'):,}원\n")
+                    for k in totals:
+                        totals[k] += int(it.get(k, 0) or 0)
+                lines.append("↓\n")
+                lines.append(f"총비목명: 합계 ({len(items)}건)")
+                lines.append(f"총이월액: {totals['CARY_AMT']:,}원")
+                lines.append(f"총예산액: {totals['BDGT_AMT']:,}원")
+                lines.append(f"총예산총액: {totals['NOW_BDGT_AMT']:,}원")
+                lines.append(f"총집행액: {totals['USE_AMT']:,}원")
+                lines.append(f"총잔액: {totals['USE_BALC_AMT']:,}원")
+                lines.append(f"총진행중: {totals['NOT_USE_AMT']:,}원")
+                lines.append(f"총진행포함잔액: {totals['NOT_USE_BALC_AMT']:,}원")
+                payload = {
+                    "_runningNana": RsbPrjfi100_nana,
+                    "_runningLoginIdenNo": rv[1],
+                    "_runningMainOpenKey": rv[2],
+                    "@d1#PROJ_NO": "S2026G999900003", # 대응
+                    "@d1#SEARCH_GB": "1",
+                    "@d1#GRD_GB": "2",
+                    "@d1#SUPP_DIV_CD": "SB115.60",
+                    "@d#": "@d1#", "@d1#": "dmSearchBdgt", "@d1#tp": "dm",
+                }
+                res = session.post(
+                    "https://ndrims.dongguk.edu/rs/rsb/prjfi/RsbPrjfi100/doListBdgt.do",
+                    data=payload, timeout=10
+                )
+                data = res.json()
+                if isinstance(data.get("dsBdgt"), list):
+                    items = data.get("dsBdgt", [])
+                elif isinstance(data.get("dsBdgt"), dict):
+                    items = data.get("dsBdgt", {}).get("dsBdgt", []) or []
+                else:
+                    items = []
+                totals = {k: 0 for k in ("CARY_AMT", "BDGT_AMT", "NOW_BDGT_AMT", "USE_AMT", "USE_BALC_AMT", "NOT_USE_AMT", "NOT_USE_BALC_AMT")}
+                lines.append("\n• 법인카드\n")
+                for it in items:
+                    def a(key): return int(it.get(key, 0) or 0)
+                    lines.append(f"비목명: {it.get('PROJ_ITEM_NM', '')}")
+                    lines.append(f"이월액: {a('CARY_AMT'):,}원")
+                    lines.append(f"예산액: {a('BDGT_AMT'):,}원")
+                    lines.append(f"예산총액: {a('NOW_BDGT_AMT'):,}원")
+                    lines.append(f"집행액: {a('USE_AMT'):,}원")
+                    lines.append(f"잔액: {a('USE_BALC_AMT'):,}원")
+                    lines.append(f"진행중: {a('NOT_USE_AMT'):,}원")
+                    lines.append(f"진행포함잔액: {a('NOT_USE_BALC_AMT'):,}원\n")
+                    for k in totals:
+                        totals[k] += int(it.get(k, 0) or 0)
+                lines.append("↓\n")
+                lines.append(f"총비목명: 합계 ({len(items)}건)")
+                lines.append(f"총이월액: {totals['CARY_AMT']:,}원")
+                lines.append(f"총예산액: {totals['BDGT_AMT']:,}원")
+                lines.append(f"총예산총액: {totals['NOW_BDGT_AMT']:,}원")
+                lines.append(f"총집행액: {totals['USE_AMT']:,}원")
+                lines.append(f"총잔액: {totals['USE_BALC_AMT']:,}원")
+                lines.append(f"총진행중: {totals['NOT_USE_AMT']:,}원")
+                lines.append(f"총진행포함잔액: {totals['NOT_USE_BALC_AMT']:,}원")
+                result = "\n".join(lines)
+                cache_save(action, result)
+                return result
+
+            else:  #  action == "research_details"
+                lines = ["📋 연구활동비 상세\n"]
+                lines.append("현재 개발 중이에요.")
                 return "\n".join(lines)
-
-            elif action == "budget_remain":
-                lines = ["💰 예산 잔액 현황\n"]
-                for it in items[:8]:
-                    total  = int(it.get("TOT_AMT", 0) or 0)
-                    used   = int(it.get("USE_AMT", 0) or 0)
-                    remain = total - used
-                    lines.append(
-                        f"• {it.get('PROJ_NM','')}\n"
-                        f"  잔액 {remain:,}원"
-                    )
-                return "\n".join(lines)
-
-            else:  # expense_by_item
-                return "📋 항목별 지출 조회는 현재 개발 중이에요."
 
         else:
             return f"⚠️ '{action}' 액션은 아직 구현되지 않았어요."
 
     except Exception as e:
+        text, _ = cache_load(action)
+        if text:
+            return text
         return f"⚠️ NDRIMS 조회 중 오류가 발생했어요.\n{type(e).__name__}: {e}"
 
 
 # ── 쿠키 갱신 처리 ───────────────────────────────────────────
 # 세션별로 쿠키 입력 대기 상태를 기록
-cookie_pending: set = set()   # user_id 집합
+cookie_pending: dict[str, str] = {}   # user_id -> "password" | "cookie"
+
+def looks_like_cookie_input(utterance: str) -> bool:
+    text = utterance.strip().upper()
+    return "WMONID" in text or "JSESSIONID" in text
+
 
 def handle_cookie_input(user_id: str, utterance: str) -> str | None:
     """
     쿠키 갱신 대화 흐름:
-    1) 버튼 클릭 → "COOKIE_WAIT" 상태 진입 → 입력 안내 반환
-    2) 다음 발화에서 'WMONID=xxx JSESSIONID=yyy' 파싱 → 저장
+    1) 버튼 클릭 → 비밀번호 입력 대기
+    2) 비밀번호 확인 후 쿠키 입력 대기
+    3) 다음 발화에서 'WMONID=xxx JSESSIONID=yyy' 파싱 → 저장
     """
-    if user_id in cookie_pending:
+    stage = cookie_pending.get(user_id)
+    if stage:
+        if not utterance.strip():
+            return None
+
+        if utterance.strip() in ("처음으로", "시작", "메인", "홈"):
+            cookie_pending.pop(user_id, None)
+            return None
+
+        if stage == "password":
+            if not ADMIN_PASSWORD:
+                cookie_pending.pop(user_id, None)
+                return MSG_NO_ADMIN_PW
+
+            if utterance.strip() == ADMIN_PASSWORD:
+                cookie_pending[user_id] = "cookie"
+                return MSG_PASSWORD_OK
+
+            if not looks_like_cookie_input(utterance):
+                cookie_pending.pop(user_id, None)
+                return None
+
+            cookie_pending.pop(user_id, None)
+            return MSG_WRONG_PASSWORD
+
+        if not looks_like_cookie_input(utterance):
+            cookie_pending.pop(user_id, None)
+            return None
+
         # 입력 파싱 시도
         m_wmon = re.search(r"WMONID\s*=\s*(\S+)", utterance, re.I)
         m_sess = re.search(r"JSESSIONID\s*=\s*(\S+)", utterance, re.I)
         if m_wmon and m_sess:
             cookie_store["WMONID"]     = m_wmon.group(1)
             cookie_store["JSESSIONID"] = m_sess.group(1)
-            cookie_pending.discard(user_id)
+            save_cookies()
+            cookie_pending.pop(user_id, None)
             return (
                 "✅ 쿠키가 갱신됐어요!\n\n"
                 f"WMONID: {cookie_store['WMONID'][:8]}…\n"
                 f"JSESSIONID: {cookie_store['JSESSIONID'][:8]}…"
             )
         else:
-            cookie_pending.discard(user_id)
-            return (
-                "❌ 형식이 맞지 않아요. 다시 시도해 주세요.\n\n"
-                "올바른 형식:\n"
-                "WMONID=값 JSESSIONID=값"
-            )
+            return MSG_WRONG_FORMAT
     return None   # 쿠키 대기 상태 아님
 
 
@@ -309,7 +607,7 @@ def quick(label: str, msg: str) -> dict:
 
 def make_main_menu() -> dict:
     """메인 메뉴: 1단계 버튼들."""
-    replies = [quick(v["label"], f"__MENU__{k}") for k, v in MENU.items()]
+    replies = [quick(v["label"], v["label"]) for k, v in MENU.items()]
     replies = replies[:MAX_QUICK]
     return {
         "version": "2.0",
@@ -323,7 +621,7 @@ def make_submenu(node: dict, title: str) -> dict:
     """2단계 버튼 목록."""
     replies = []
     for cid, child in node["children"].items():
-        replies.append(quick(child["label"], f"__MENU__{cid}"))
+        replies.append(quick(child["label"], child["label"]))
     replies.append(quick("🏠 처음으로", "처음으로"))
     replies = replies[:MAX_QUICK]
     return {
@@ -370,7 +668,10 @@ def find_node(menu_id: str) -> tuple[dict | None, list[str]]:
 def route(utterance: str, user_id: str) -> dict:
     utt = utterance.strip()
 
-    # 처음으로
+    # 빈 발화는 메인 메뉴 표시
+    if not utt:
+        return make_main_menu()
+
     if utt in ("처음으로", "시작", "메인", "홈"):
         return make_main_menu()
 
@@ -384,40 +685,38 @@ def route(utterance: str, user_id: str) -> dict:
         menu_id = utt[len("__MENU__"):]
         node, path = find_node(menu_id)
 
-        if node is None:
-            return make_text_response("⚠️ 메뉴를 찾을 수 없어요.")
+    # 버튼 텍스트가 label로 들어오는 경우
+    elif utt in MENU_LABEL_INDEX:
+        menu_id = MENU_LABEL_INDEX[utt]
+        node, path = find_node(menu_id)
+    else:
+        node, path = None, []
 
-        atype  = node.get("action_type")
-        action = node.get("action")
+    if node is None:
+        return make_text_response(ERR_MENU_NOT_FOUND)
 
-        # 하위 메뉴가 있으면 서브메뉴 표시
-        if node["children"]:
-            return make_submenu(node, " > ".join(path))
+    atype  = node.get("action_type")
+    action = node.get("action")
 
-        # TEXT 응답
-        if atype == "TEXT":
-            text = TEXT_RESPONSES.get(action, f"'{action}' 응답이 아직 없어요.")
-            return make_text_response(text)
+    # 하위 메뉴가 있으면 서브메뉴 표시
+    if node["children"]:
+        return make_submenu(node, " > ".join(path))
 
-        # COOKIE 갱신
-        if atype == "COOKIE":
-            cookie_pending.add(user_id)
-            return make_text_response(
-                "🔐 쿠키 갱신\n\n"
-                "아래 형식으로 입력해 주세요:\n\n"
-                "WMONID=값 JSESSIONID=값\n\n"
-                "브라우저 개발자 도구(F12) → Application\n"
-                "→ Cookies 에서 값을 복사하세요."
-            )
+    # TEXT 응답
+    if atype == "TEXT":
+        text = TEXT_RESPONSES.get(action, f"'{action}' 응답이 아직 없어요.")
+        return make_text_response(text)
 
-        # NDRIMS API — 콜백으로 처리 (시간이 걸릴 수 있으므로)
-        if atype == "NDRIMS":
-            return None  # 콜백 필요 신호
+    # COOKIE 갱신
+    if atype == "COOKIE":
+        cookie_pending[user_id] = "password"
+        return make_text_response(MSG_COOKIE_START)
 
-        return make_text_response("⚠️ 알 수 없는 액션 타입이에요.")
+    # NDRIMS API — 콜백으로 처리 (시간이 걸릴 수 있으므로)
+    if atype == "NDRIMS":
+        return None  # 콜백 필요 신호
 
-    # 자유 발화 — 메인 메뉴로 안내
-    return make_main_menu()
+    return make_text_response(ERR_UNKNOWN_ATYPE)
 
 
 # ── HTTP 서버 ────────────────────────────────────────────────
@@ -437,7 +736,7 @@ class Handler(BaseHTTPRequestHandler):
         print(f"[{self.address_string()}] {fmt % args}")
 
     def do_GET(self):
-        self._json(200, {"status": "ok", "message": "NDRIMS 규정봇 실행 중"})
+        self._json(200, {"status": "ok", "message": "nDRIMS 봇 실행 중"})
 
     def do_POST(self):
         if self.path != "/skill":
@@ -456,9 +755,21 @@ class Handler(BaseHTTPRequestHandler):
 
         # NDRIMS 호출이 필요한 경우 (route가 None 반환)
         if response is None:
-            menu_id = utterance[len("__MENU__"):]
+            # resolve menu id from either internal token or visible label
+            if utterance.startswith("__MENU__"):
+                menu_id = utterance[len("__MENU__"):]
+            elif utterance in MENU_LABEL_INDEX:
+                menu_id = MENU_LABEL_INDEX[utterance]
+            else:
+                self._json(200, make_text_response("⚠️ 메뉴를 찾을 수 없어요."))
+                return
+
             node, _ = find_node(menu_id)
-            action  = node["action"] if node else ""
+            if not node:
+                self._json(200, make_text_response("⚠️ 메뉴를 찾을 수 없어요."))
+                return
+
+            action = node.get("action", "")
 
             if callback_url:
                 self._json(200, make_waiting())
@@ -484,6 +795,5 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
-    print(f"✅ NDRIMS 규정봇 서버 시작 — http://0.0.0.0:{port}/skill")
-    print(f"   쿠키 상태: WMONID={'설정됨' if cookie_store['WMONID'] else '미설정'}")
+    print(f"✅ nDRIMS 챗봇 서버 시작 — http://0.0.0.0:{port}/skill")
     HTTPServer(("0.0.0.0", port), Handler).serve_forever()
