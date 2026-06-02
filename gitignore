@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+.env
+# 쿠키값이 담긴 환경파일은 절대 올리지 마세요
+.env.local
