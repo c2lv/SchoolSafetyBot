@@ -703,7 +703,7 @@ def make_submenu(node: dict, title: str) -> dict:
 
 def make_text_response(text: str, back_label: str = "🏠 처음으로") -> dict:
     btn = {"action": "message", "label": back_label[:14], "messageText": "처음으로"}
-    if len(text) <= 1000:
+    if len(text) <= 400:
         return {
             "version": "2.0",
             "template": {
