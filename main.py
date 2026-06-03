@@ -847,6 +847,7 @@ class Handler(BaseHTTPRequestHandler):
         utterance    = body.get("userRequest", {}).get("utterance", "").strip()
         user_id      = body.get("userRequest", {}).get("user", {}).get("id", "anonymous")
         callback_url = body.get("callback_url", "")
+        print(f"[CB URL] {callback_url[:40] if callback_url else '없음'}")
 
         print(f"[Q] {user_id[:8]}… | {utterance[:60]}")
 
