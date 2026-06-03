@@ -263,6 +263,7 @@ def call_ndrims(action: str) -> str:
             menu_data = menu_res.json()
             print(f"[NDRIMS] doListUserMenuListLeft 호출 성공")
             # dsUserMenuListLeft에서 PGM_URL이 app/rs/rsb/prjfi/RsbPrjfi100인 항목 찾기
+            RsbPrjfi100_nana = None
             menu_items = menu_data.get("dsUserMenuListLeft", [])
             for item in menu_items:
                 pgm_url = item.get("PGM_URL") or ""
@@ -270,6 +271,8 @@ def call_ndrims(action: str) -> str:
                     RsbPrjfi100_nana = item.get("NANA")
                     print(f"[NDRIMS] RsbPrjfi100_nana 추출: {RsbPrjfi100_nana[:8] if RsbPrjfi100_nana else 'EMPTY'}...")
                     break
+            if not RsbPrjfi100_nana:
+                raise ValueError("RsbPrjfi100 메뉴 항목을 찾을 수 없어요.")
         except Exception as e:
             print(f"[NDRIMS] ⚠️ 에러: {e}")
             text, _ = cache_load(action)
@@ -521,13 +524,57 @@ def call_ndrims(action: str) -> str:
                 cache_save(action, result)
                 return result
 
-            else:  #  action == "research_details"
-                lines = ["📋 연구활동비 상세\n"]
-                lines.append("현재 개발 중이에요.")
-                return "\n".join(lines)
+            elif action == "research_details":
+                def fetch_groups(proj_no: str) -> dict:
+                    p = {
+                        "_runningNana": RsbPrjfi100_nana,
+                        "_runningLoginIdenNo": rv[1],
+                        "_runningMainOpenKey": rv[2],
+                        "@d1#PROJ_NO": proj_no,
+                        "@d1#APRV_INCLD_YN": "Y",
+                        "@d#": "@d1#", "@d1#": "dmSearchDscMain", "@d1#tp": "dm",
+                    }
+                    r = session.post(
+                        "https://ndrims.dongguk.edu/rs/rsb/prjfi/RsbPrjfi100/doListDscMain.do",
+                        data=p, timeout=10
+                    )
+                    d = r.json()
+                    if isinstance(d.get("dsDscMain"), list):
+                        raw = d.get("dsDscMain", [])
+                    elif isinstance(d.get("dsDscMain"), dict):
+                        raw = d.get("dsDscMain", {}).get("dsDscMain", []) or []
+                    else:
+                        raw = []
+                    grps: dict[str, dict] = {}
+                    for it in raw:
+                        if it.get("PROJ_ITEM_NM") != "연구활동비":
+                            continue
+                        typ = it.get("EXPS_TYP_CD_NM") or "기타"
+                        if typ not in grps:
+                            grps[typ] = {"count": 0, "amount": 0}
+                        grps[typ]["count"] += 1
+                        grps[typ]["amount"] += int(it.get("USE_AMT", 0) or 0)
+                    return grps
+
+                def append_section(lines: list, label: str, grps: dict) -> tuple[int, int]:
+                    lines.append(f"• {label}\n")
+                    sc = sa = 0
+                    for typ, g in grps.items():
+                        lines.append(f"{typ}: 총 {g['count']}건 {g['amount']:,}원")
+                        sc += g["count"]; sa += g["amount"]
+                    lines.append(f"총사용금액: 총 {sc}건 {sa:,}원\n")
+                    return sc, sa
+
+                lines = ["📋 연구활동비 상세\n(" + get_kst() + " 기준)\n"]
+                c1, a1 = append_section(lines, "연구비카드", fetch_groups("S2026A043400091"))
+                c2, a2 = append_section(lines, "법인카드",   fetch_groups("S2026G999900003"))
+                lines.append(f"합계: 총 {c1+c2}건 {a1+a2:,}원")
+                result = "\n".join(lines)
+                cache_save(action, result)
+                return result
 
         else:
-            return f"⚠️ '{action}' 액션은 아직 구현되지 않았어요."
+            return f"⚠️ '{action}' 기능은 아직 구현되지 않았어요."
 
     except Exception as e:
         text, _ = cache_load(action)
@@ -612,27 +659,57 @@ def make_main_menu() -> dict:
     return {
         "version": "2.0",
         "template": {
-            "outputs": [{"simpleText": {"text": "🏠 메인 메뉴\n무엇을 도와드릴까요?"}}],
+            "outputs": [{"basicCard": {
+                "title": "학교종합안전연구소",
+                "description": "무엇을 도와드릴까요?",
+            }}],
             "quickReplies": replies,
         }
     }
 
 def make_submenu(node: dict, title: str) -> dict:
-    """2단계 버튼 목록."""
-    replies = []
-    for cid, child in node["children"].items():
-        replies.append(quick(child["label"], child["label"]))
-    replies.append(quick("🏠 처음으로", "처음으로"))
-    replies = replies[:MAX_QUICK]
+    children = list(node["children"].values())
+    card_title = title.split(" > ")[-1]
+
+    if len(children) < 6:
+        replies = [quick(c["label"], c["label"]) for c in children]
+        replies.append(quick("🏠 처음으로", "처음으로"))
+        return {
+            "version": "2.0",
+            "template": {
+                "outputs": [{"basicCard": {
+                    "title": card_title,
+                    "description": "항목을 선택해 주세요.",
+                }}],
+                "quickReplies": replies[:MAX_QUICK],
+            }
+        }
+
+    btns = [
+        {"label": c["label"][:14], "action": "message", "messageText": c["label"]}
+        for c in children
+    ]
+    btns.append({"label": "🏠 처음으로", "action": "message", "messageText": "처음으로"})
+    cards = [
+        {"title": card_title, "description": "항목을 선택해 주세요.", "buttons": btns[i:i+3]}
+        for i in range(0, len(btns), 3)
+    ]
     return {
         "version": "2.0",
         "template": {
-            "outputs": [{"simpleText": {"text": f"{title}\n항목을 선택해 주세요."}}],
-            "quickReplies": replies,
+            "outputs": [{"carousel": {"type": "basicCard", "items": cards}}],
         }
     }
 
 def make_text_response(text: str, back_label: str = "🏠 처음으로") -> dict:
+    btn = {"action": "message", "label": back_label[:14], "messageText": "처음으로"}
+    if len(text) <= 1000:
+        return {
+            "version": "2.0",
+            "template": {
+                "outputs": [{"textCard": {"text": text, "buttons": [btn]}}],
+            }
+        }
     return {
         "version": "2.0",
         "template": {
@@ -652,7 +729,7 @@ def find_node(menu_id: str) -> tuple[dict | None, list[str]]:
     if menu_id in MENU:
         return MENU[menu_id], [MENU[menu_id]["label"]]
     # 2단계
-    for k1, v1 in MENU.items():
+    for _, v1 in MENU.items():
         if menu_id in v1["children"]:
             node = v1["children"][menu_id]
             return node, [v1["label"], node["label"]]
@@ -704,7 +781,7 @@ def route(utterance: str, user_id: str) -> dict:
 
     # TEXT 응답
     if atype == "TEXT":
-        text = TEXT_RESPONSES.get(action, f"'{action}' 응답이 아직 없어요.")
+        text = TEXT_RESPONSES.get(action, ERR_UNKNOWN_ATYPE)
         return make_text_response(text)
 
     # COOKIE 갱신
@@ -773,9 +850,14 @@ class Handler(BaseHTTPRequestHandler):
 
             if callback_url:
                 self._json(200, make_waiting())
+                _action, _url = action, callback_url
                 def bg():
-                    text = call_ndrims(action)
-                    send_callback(callback_url, make_text_response(text))
+                    try:
+                        text = call_ndrims(_action)
+                    except Exception as e:
+                        cached, _ = cache_load(_action)
+                        text = cached or f"⚠️ 오류가 발생했어요.\n{type(e).__name__}: {e}"
+                    send_callback(_url, make_text_response(text))
                 threading.Thread(target=bg, daemon=True).start()
             else:
                 text = call_ndrims(action)
