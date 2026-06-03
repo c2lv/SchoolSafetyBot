@@ -692,7 +692,7 @@ def make_submenu(node: dict, title: str) -> dict:
     ]
     btns.append({"label": "🏠 처음으로", "action": "message", "messageText": "처음으로"})
     cards = [
-        {"title": card_title, "description": "항목을 선택해 주세요.", "buttons": btns[i:i+3]}
+        {**basic_card(card_title, "항목을 선택해 주세요."), "buttons": btns[i:i+3]}
         for i in range(0, len(btns), 3)
     ]
     return {
