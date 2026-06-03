@@ -45,6 +45,7 @@ if DOTENV_OK:
     load_dotenv(BASE_DIR / ".env")
 
 ADMIN_PASSWORD = os.environ.get("DGUSSB_PASSWORD", "")
+_base_url = ""  # 첫 요청 시 Host 헤더에서 자동 감지
 
 # ── Utils ────────────────────────────────────────────
 def get_kst() -> str:
@@ -652,6 +653,12 @@ MAX_QUICK = 10   # 카카오 퀵리플라이 최대 10개
 def quick(label: str, msg: str) -> dict:
     return {"label": label[:14], "action": "message", "messageText": msg}
 
+def basic_card(title: str, description: str) -> dict:
+    card = {"title": title, "description": description}
+    if _base_url and (BASE_DIR / "thumbnail.jpg").exists():
+        card["thumbnail"] = {"imageUrl": f"{_base_url}/thumbnail.jpg"}
+    return card
+
 def make_main_menu() -> dict:
     """메인 메뉴: 1단계 버튼들."""
     replies = [quick(v["label"], v["label"]) for k, v in MENU.items()]
@@ -659,10 +666,7 @@ def make_main_menu() -> dict:
     return {
         "version": "2.0",
         "template": {
-            "outputs": [{"basicCard": {
-                "title": "학교종합안전연구소",
-                "description": "무엇을 도와드릴까요?",
-            }}],
+            "outputs": [{"basicCard": basic_card("학교종합안전연구소", "무엇을 도와드릴까요?")}],
             "quickReplies": replies,
         }
     }
@@ -677,10 +681,7 @@ def make_submenu(node: dict, title: str) -> dict:
         return {
             "version": "2.0",
             "template": {
-                "outputs": [{"basicCard": {
-                    "title": card_title,
-                    "description": "항목을 선택해 주세요.",
-                }}],
+                "outputs": [{"basicCard": basic_card(card_title, "항목을 선택해 주세요.")}],
                 "quickReplies": replies[:MAX_QUICK],
             }
         }
@@ -813,9 +814,30 @@ class Handler(BaseHTTPRequestHandler):
         print(f"[{self.address_string()}] {fmt % args}")
 
     def do_GET(self):
+        self._detect_base_url()
+        if self.path == "/thumbnail.jpg":
+            img_path = BASE_DIR / "thumbnail.jpg"
+            if img_path.exists():
+                data = img_path.read_bytes()
+                self.send_response(200)
+                self.send_header("Content-Type", "image/jpeg")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                return
+            self._json(404, {"error": "not found"})
+            return
         self._json(200, {"status": "ok", "message": "nDRIMS 봇 실행 중"})
 
+    def _detect_base_url(self):
+        global _base_url
+        if not _base_url:
+            host = self.headers.get("Host", "")
+            if host:
+                _base_url = f"https://{host}"
+
     def do_POST(self):
+        self._detect_base_url()
         if self.path != "/skill":
             self._json(404, {"error": "not found"}); return
 
