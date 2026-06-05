@@ -13,8 +13,7 @@ from text_responses import (
     TEXT_RESPONSES,
     ERR_NO_REQUESTS, ERR_NO_COOKIE, ERR_NDRIMS_CONN,
     ERR_MENU_NOT_FOUND, ERR_UNKNOWN_ATYPE, ERR_UNKNOWN_DATA,
-    MSG_COOKIE_START, MSG_NO_ADMIN_PW, MSG_PASSWORD_OK,
-    MSG_WRONG_PASSWORD, MSG_WRONG_FORMAT,
+    MSG_NO_ADMIN_PW, MSG_WRONG_PASSWORD, MSG_REQUEST_PW
 )
 
 # openpyxl 은 pip install openpyxl 로 설치
@@ -585,66 +584,37 @@ def call_ndrims(action: str) -> str:
 
 
 # ── 쿠키 갱신 처리 ───────────────────────────────────────────
-# 세션별로 쿠키 입력 대기 상태를 기록
-cookie_pending: dict[str, str] = {}   # user_id -> "password" | "cookie"
-
-def looks_like_cookie_input(utterance: str) -> bool:
-    text = utterance.strip().upper()
-    return "WMONID" in text or "JSESSIONID" in text
-
+# cookie_pending[user_id] = ("password"|"value", "wmonid"|"jsessionid")
+cookie_pending: dict[str, tuple] = {}
 
 def handle_cookie_input(user_id: str, utterance: str) -> str | None:
-    """
-    쿠키 갱신 대화 흐름:
-    1) 버튼 클릭 → 비밀번호 입력 대기
-    2) 비밀번호 확인 후 쿠키 입력 대기
-    3) 다음 발화에서 'WMONID=xxx JSESSIONID=yyy' 파싱 → 저장
-    """
-    stage = cookie_pending.get(user_id)
-    if stage:
-        if not utterance.strip():
-            return None
+    state = cookie_pending.get(user_id)
+    if not state:
+        return None
 
-        if utterance.strip() in ("처음으로", "시작", "메인", "홈"):
+    utt = utterance.strip()
+    if not utt or utt in ("처음으로", "시작", "메인", "홈"):
+        cookie_pending.pop(user_id, None)
+        return None
+
+    step, target = state
+    label = "WMONID" if target == "wmonid" else "JSESSIONID"
+
+    if step == "password":
+        if not ADMIN_PASSWORD:
             cookie_pending.pop(user_id, None)
-            return None
+            return MSG_NO_ADMIN_PW
+        if utt == ADMIN_PASSWORD:
+            cookie_pending[user_id] = ("value", target)
+            return f"✅ 비밀번호 확인됐어요.\n\n{label} 값을 입력해 주세요."
+        cookie_pending.pop(user_id, None)
+        return MSG_WRONG_PASSWORD
 
-        if stage == "password":
-            if not ADMIN_PASSWORD:
-                cookie_pending.pop(user_id, None)
-                return MSG_NO_ADMIN_PW
-
-            if utterance.strip() == ADMIN_PASSWORD:
-                cookie_pending[user_id] = "cookie"
-                return MSG_PASSWORD_OK
-
-            if not looks_like_cookie_input(utterance):
-                cookie_pending.pop(user_id, None)
-                return None
-
-            cookie_pending.pop(user_id, None)
-            return MSG_WRONG_PASSWORD
-
-        if not looks_like_cookie_input(utterance):
-            cookie_pending.pop(user_id, None)
-            return None
-
-        # 입력 파싱 시도
-        m_wmon = re.search(r"WMONID\s*=\s*(\S+)", utterance, re.I)
-        m_sess = re.search(r"JSESSIONID\s*=\s*(\S+)", utterance, re.I)
-        if m_wmon and m_sess:
-            cookie_store["WMONID"]     = m_wmon.group(1)
-            cookie_store["JSESSIONID"] = m_sess.group(1)
-            save_cookies()
-            cookie_pending.pop(user_id, None)
-            return (
-                "✅ 쿠키가 갱신됐어요!\n\n"
-                f"WMONID: {cookie_store['WMONID'][:8]}…\n"
-                f"JSESSIONID: {cookie_store['JSESSIONID'][:8]}…"
-            )
-        else:
-            return MSG_WRONG_FORMAT
-    return None   # 쿠키 대기 상태 아님
+    # step == "value": 그대로 저장
+    cookie_store[label] = utt
+    save_cookies()
+    cookie_pending.pop(user_id, None)
+    return f"✅ {label} 갱신 완료!\n\n{utt[:8]}…"
 
 
 # ── 카카오 응답 빌더 ─────────────────────────────────────────
@@ -787,8 +757,12 @@ def route(utterance: str, user_id: str) -> dict:
 
     # COOKIE 갱신
     if atype == "COOKIE":
-        cookie_pending[user_id] = "password"
-        return make_text_response(MSG_COOKIE_START)
+        if action == "update_wmonid":
+            cookie_pending[user_id] = ("password", "wmonid")
+            return make_text_response("🔐 WMONID" + MSG_REQUEST_PW)
+        elif action == "update_jsessionid":
+            cookie_pending[user_id] = ("password", "jsessionid")
+            return make_text_response("🔐 JSESSIONID" + MSG_REQUEST_PW)
 
     # NDRIMS API — 콜백으로 처리 (시간이 걸릴 수 있으므로)
     if atype == "NDRIMS":
